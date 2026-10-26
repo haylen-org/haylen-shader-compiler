@@ -1,0 +1,51 @@
+name: CI
+
+# The workflow only builds and tests: it publishes nothing, and tags and releases start no run.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Every commit of `main` gets a complete run of its own, while a newer push to another branch or pull request supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # Dawn fetches the sources of its dependencies with a Python script while CMake configures it.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15"
+      - name: Install Ninja
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install Ninja
+        if: runner.os != 'Linux'
+        run: pip install ninja
+      # The compilers of Visual Studio build for the architecture of the runner, native on ARM64 too.
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: actions/cache@v6
+        with:
+          path: .cache/cpm
+          key: cpm-${{ runner.os }}-${{ hashFiles('cmake/haylen-shaderc-dependencies.cmake', 'cmake/cpm.cmake') }}
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

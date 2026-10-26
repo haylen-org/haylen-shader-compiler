@@ -1,0 +1,6 @@
+/build/
+/.cache/
+/.deps/
+/.idea/
+/.vscode/
+.DS_Store

@@ -1,0 +1,163 @@
+name: Release
+
+# A pushed version tag builds the command for every system, checks every build, and publishes the archives with their checksums in the release of the tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-universal
+            os: macos-latest
+          - platform: linux-x64
+            os: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - platform: linux-arm64
+            os: ubuntu-22.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+          - platform: windows-x64
+            os: windows-latest
+          - platform: windows-arm64
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    # The Linux builds run in a manylinux container, whose glibc 2.28 is older than the one of almost every distribution in use, and whose GCC 14 compiles C++20 with "std::format". They link the C++ library of that GCC statically.
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      # Dawn fetches the sources of its dependencies with a Python script while CMake configures it, and the container brings its own Python.
+      - uses: actions/setup-python@v7
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.15"
+      - name: Use the Python of the container
+        if: runner.os == 'Linux'
+        run: echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
+      - name: Install CMake and Ninja
+        run: |
+          python -m pip install cmake ninja
+          echo "CPM_SOURCE_CACHE=$GITHUB_WORKSPACE/.cache/cpm" >> "$GITHUB_ENV"
+      # The compilers of Visual Studio build for the architecture of the runner, native on ARM64 too.
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: actions/cache@v6
+        with:
+          path: .cache/cpm
+          key: cpm-${{ runner.os }}-${{ hashFiles('cmake/haylen-shaderc-dependencies.cmake', 'cmake/cpm.cmake') }}
+      - name: Read the version of the tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$(tr -d '[:space:]' < VERSION)" ]; then
+            echo "The tag \"$GITHUB_REF_NAME\" does not match the version \"$(cat VERSION)\" of the file \"VERSION\"."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The macOS build holds both architectures and runs from macOS 14.0 on, like Haylen, and the Linux and Windows builds carry their C++ runtimes, so no build needs a library that the system lacks.
+      - name: Configure
+        run: |
+          options=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DHAYLEN_SHADERC_BUILD_TESTS=OFF)
+          case "${{ matrix.platform }}" in
+            macos-universal) options+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0) ;;
+            linux-*) options+=("-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc") ;;
+            windows-*) options+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded) ;;
+          esac
+          cmake -S . -B build "${options[@]}"
+      - name: Build
+        run: cmake --build build --target haylen-shaderc
+      - name: Check the executable
+        run: |
+          executable=build/haylen-shaderc
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            executable=build/haylen-shaderc.exe
+          fi
+          printed="$("$executable" --version | tr -d '\r')"
+          if [ "$printed" != "haylen-shaderc ${{ steps.version.outputs.version }}" ]; then
+            echo "The command prints \"$printed\" as its version."
+            exit 1
+          fi
+          "$executable" tests/data/engine/sprite.glsl --include tests/data/engine/include --variant sprite= --variant sprite_lit=HAYLEN_LIT --output sprite.shader
+          python -c "import json; package = json.load(open('sprite.shader')); assert package['format'] == 'haylen-shader' and list(package['programs']) == ['sprite', 'sprite_lit'] and len(package['programs']['sprite']['targets']) == 8"
+          case "${{ runner.os }}" in
+            macOS)
+              lipo -info "$executable"
+              vtool -show-build "$executable"
+              if arch -x86_64 /usr/bin/true 2> /dev/null; then
+                arch -x86_64 "$executable" --version
+              fi
+              ;;
+            Linux)
+              ldd "$executable"
+              if ldd "$executable" | grep -qE 'libstdc\+\+|libgcc_s'; then
+                echo "The executable links the C++ library of the system."
+                exit 1
+              fi
+              echo "The executable needs glibc $(objdump -T "$executable" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1 | cut -d_ -f2) or later."
+              ;;
+            Windows)
+              machine="x64"
+              if [ "${{ matrix.platform }}" = "windows-arm64" ]; then
+                machine="ARM64"
+              fi
+              if ! dumpbin -nologo -headers "$executable" | grep -F "machine ($machine)"; then
+                echo "The executable is not built for the $machine machine."
+                exit 1
+              fi
+              dependents="$(dumpbin -nologo -dependents "$executable" | tr -d '\r' | grep -iE '^\s+\S+\.dll$' | tr -d ' ')"
+              echo "$dependents"
+              if [ "$dependents" != "KERNEL32.dll" ]; then
+                echo "The executable needs other libraries than \"KERNEL32.dll\"."
+                exit 1
+              fi
+              ;;
+          esac
+      - name: Pack the executable and the license
+        run: |
+          name="haylen-shaderc-${{ steps.version.outputs.version }}-${{ matrix.platform }}"
+          mkdir -p package dist
+          cp LICENSE package/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp build/haylen-shaderc.exe package/
+            (cd package && 7z a -tzip "../dist/$name.zip" haylen-shaderc.exe LICENSE)
+          else
+            cp build/haylen-shaderc package/
+            tar -czf "dist/$name.tar.gz" -C package haylen-shaderc LICENSE
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          sha256sum haylen-shaderc-* > SHA256SUMS
+          cat SHA256SUMS
+          version="${GITHUB_REF_NAME#v}"
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Haylen Shader Compiler $version" --notes "The command \`haylen-shaderc\` $version for macOS, Linux and Windows. Every archive holds the executable and its license, and \`SHA256SUMS\` lists the SHA-256 of every archive, which \`sha256sum --check --ignore-missing SHA256SUMS\` verifies."
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber haylen-shaderc-* SHA256SUMS
